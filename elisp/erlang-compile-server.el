@@ -1,3 +1,15 @@
+;;;-------------------------------------------------------------
+;;; File    : erlang-compile-server.el
+;;; Author  : Sebastian Weddmark Olsson
+;;;           github.com/sebastiw
+;;; Purpose : Used with distel to mark compilation/xref/dialyzer
+;;;           & eunit errors and warnings while writing, in the
+;;;           current buffer.
+;;; 
+;;; Created : June 2012 as an internship at Klarna AB
+;;; Comment : Please let me know if you find any bugs or you
+;;;           want some feature or something
+;;;------------------------------------------------------------
 (require 'distel)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -5,6 +17,9 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Customization
+(defvar erl-ecs-backends '(compiler xref dialyzer eunit)
+  "These backends will be activated.")
+
 (defvar erl-ecs-enable-eunit t
 "If non-nil also checks the eunit tests in the module-file.")
 
@@ -44,6 +59,10 @@ Erlang example: [{35, warning, {err_type, \"There is a cat in the ceiling.\"}}],
 Elisp : (list (tuple 35 'warning (tuple err_type \"There is a cat in the ceiling.\"))).")
 
 (defvar erl-ecs-lineno-list '())
+(defvar erl-ecs-error-index 0)
+
+(defvar erl-ecs-before-eval-hooks '())
+(defvar erl-ecs-after-eval-hooks '())
 
 ;; Faces for highlighting
 (defface erl-ecs-error-line
@@ -74,12 +93,15 @@ Elisp : (list (tuple 35 'warning (tuple err_type \"There is a cat in the ceiling
   "Face used for marking lesser warning lines."
   :group 'erl-ecs)
 
+(defvar erl-node-isup nil)
 
 ;; Check that module is loaded else load it
 (add-hook 'erl-nodeup-hook 'erl-ecs-check-backend)
+(add-hook 'erl-nodedown-hook 'erl-ecs-nodedown)
 
 (defun erl-ecs-check-backend (node _fsm)
   "Reloads 'erlang_compile_server' module to `node'."
+  (setq erl-node-isup t)
   (unless distel-inhibit-backend-check
     (progn (erl-ecs-message "ECS: reloading 'erlang_compile_server' onto %s" node)
 	   (erl-spawn
@@ -92,14 +114,18 @@ Elisp : (list (tuple 35 'warning (tuple err_type \"There is a cat in the ceiling
 		   (&erl-load-backend node))
 		  (_ t)))))))
 
+(defun erl-ecs-nodedown (node)
+  (setq erl-node-isup))
+
 (defun erl-ecs-setup ()
   (add-hook 'erlang-mode-hook 'erl-ecs-mode-hook)
 
-  (erl-ecs-message "ECS loaded.")
+  ;; for now, just set the enables on each backend
+  (unless (member 'xref erl-ecs-backends) (setq erl-ecs-enable-xref nil))
+  (unless (member 'eunit erl-ecs-backends) (setq erl-ecs-enable-eunit nil))
+  (unless (member 'dialyzer erl-ecs-backends) (setq erl-ecs-enable-dialyzer nil))
 
-  (add-to-list 'minor-mode-alist
-	       '(erl-ecs-mode
-		 " ECS"))
+  (erl-ecs-message "ECS loaded.")
 
   (when erl-ecs-check-on-interval (erl-ecs-start-interval)))
 
@@ -117,9 +143,7 @@ Add the following lines to your .emacs file (after distel is initialized):
 \(require 'erlang-compile-server)
 
 And then set one or more of the following variables (defaults):
-`erl-ecs-enable-eunit' (t) - enable eunit
-`erl-ecs-enable-xref' (t) - enable xref
-`erl-ecs-enable-dialyzer' (t) - enable dialyzer
+`erl-ecs-backends' (compiler xref dialyzer eunit)
 
 `erl-ecs-check-on-save' (t) - check on save
 `erl-ecs-compile-if-ok' (nil) - if no compile fails, compile
@@ -138,9 +162,12 @@ Bindings:
 \\[erl-ecs-evaluate] - check for errors/warnings/testfails etc
 \\[erl-ecs-next-error] - goto next error
 \\[erl-ecs-prev-error] - goto previous error"
-  nil
-  nil
-  '(("\C-c\C-dq" 'undefined)))
+  :lighter " ECS"
+  :keymap '(("\C-c\C-dq" undefined))
+  (if erl-ecs-mode
+      (setq erl-ecs-temp-output erl-popup-on-output
+	    erl-popup-on-output)
+    (setq erl-popup-on-output erl-ecs-temp-output)))
 
 (defconst erl-ecs-key-binding
   '(("\C-c\C-dq" erl-ecs-evaluate)
@@ -156,41 +183,55 @@ Bindings:
 ;;           Main             ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(defvar erl-ecs-temp-output nil)
+(defvar erl-ecs-have-already-run-once nil)
+
 (defun erl-ecs-evaluate ()
+  "Checks for errors in current buffer. If this function have been executed and the node wasn't up, you need to connect with distels ping command \\[erl-ping]."
   (interactive)
-  (erl-ecs-message "ECS: Evaluating...")
-  (setq erl-ecs-lineno-list '())
 
-  ;; seems to only work when recompiled full _plt
-  (if erl-ecs-enable-dialyzer (erl-ecs-check-dialyzer)
-    (erl-ecs-remove-overlays 'erl-ecs-dialyzer-overlay))
+  (when (or (not erl-ecs-have-already-run-once) erl-node-isup)
+    (setq erl-ecs-current-buffer (current-buffer)
+	  erl-ecs-have-already-run-once t)
 
-  (erl-ecs-check-compile)
+      (erl-ecs-message "ECS: Evaluating...")
+      (setq erl-ecs-lineno-list '())
 
-  ;; seems to only work when recompiled file
-  (if erl-ecs-enable-xref (erl-ecs-check-xref)
-    (erl-ecs-remove-overlays 'erl-ecs-xref-overlay))
+      (run-hooks 'erl-ecs-before-eval-hooks)
 
-  (if erl-ecs-enable-eunit (erl-ecs-check-eunit)
-    (erl-ecs-remove-overlays 'erl-ecs-eunit-overlay))
+      ;; seems to only work when recompiled full _plt
+      (if erl-ecs-enable-dialyzer (erl-ecs-check-dialyzer)
+	(erl-ecs-remove-overlays 'erl-ecs-dialyzer-overlay))
 
-  (if erl-ecs-user-specified-errors
-      (erl-ecs-print-errors 'user-specified-error erl-ecs-user-specified-errors 'erl-ecs-user-spec-overlay 'erl-ecs-user-specified-line)
-    (erl-ecs-remove-overlays 'erl-ecs-user-spec-overlay)))
+      (erl-ecs-check-compile)
+
+      ;; seems to only work when recompiled file
+      (if erl-ecs-enable-xref (erl-ecs-check-xref)
+	(erl-ecs-remove-overlays 'erl-ecs-xref-overlay))
+
+      (if erl-ecs-enable-eunit (erl-ecs-check-eunit)
+	(erl-ecs-remove-overlays 'erl-ecs-eunit-overlay))
+
+      (if erl-ecs-user-specified-errors
+	  (erl-ecs-print-errors 'user-specified-error erl-ecs-user-specified-errors 'erl-ecs-user-spec-overlay 'erl-ecs-user-specified-line)
+	(erl-ecs-remove-overlays 'erl-ecs-user-spec-overlay))
+
+      (run-hooks 'erl-ecs-after-eval-hooks))
+)
 
 (defun erl-ecs-check-compile (&optional compile-options)
   "Checks for compilation errors and warnings.
 
 Optional parameter `compile-options' should be a list of compile options.
 Extra compile options could also be specified by setting the `erl-ecs-compile-options'-variable."
-  (interactive)
-  (setq erl-ecs-current-buffer (current-buffer))
   (erl-ecs-message "ECS: Checking erlang faults.")
 
   (let ((node (erl-target-node))
 	(path (buffer-file-name))
 	(incstring (erl-ecs-get-includes))
 	(options (or compile-options erl-ecs-compile-options)))
+
+    (erl-ecs-remove-overlays 'erl-ecs-overlay)
 
     (erl-spawn
       (erl-send-rpc node 'erlang_compile_server 'get_warnings (list path incstring options))
@@ -199,9 +240,8 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
 	  ;; no errors
 	  ((['rex ['ok]]
 	    (erl-ecs-message "ECS erlang: No faults.")
-	    (erl-ecs-delete-items 'compile erl-ecs-lineno-list)
 	    (setq erl-ecs-error-list '())
-	    (erl-ecs-remove-overlays 'erl-ecs-overlay)
+	    (erl-ecs-delete-items 'compile erl-ecs-lineno-list)
 	    (erl-ecs-if-no-compile-faults))
 	   
 	   ;; errors
@@ -212,7 +252,6 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
 	   
 	   (else
 	    (erl-ecs-message "ECS erlang unexpected end: %s" else)))))))
-
 
 (defun erl-ecs-if-no-compile-faults ()
   "Compile if compile-if-ok is set."
@@ -234,11 +273,13 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
 
 (defun erl-ecs-check-dialyzer ()
   "Checks type and function warnings."
-  (interactive)
   (erl-ecs-message "ECS: Checking Dialyzer.")
 
   (let ((path (buffer-file-name))
 	(node (erl-target-node)))
+
+    (erl-ecs-remove-overlays 'erl-ecs-dialyzer-overlay)
+
     (erl-spawn
       (erl-send-rpc node 'erlang_compile_server 'check_dialyzer (list path))
       (erl-receive ()
@@ -246,8 +287,7 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
 	  ((['rex ['ok]]
 	    (erl-ecs-message "ECS Dialyzer: No warnings.")
 	    (setq erl-ecs-dialyzer-list '())
-	    (erl-ecs-delete-items 'dialyzer erl-ecs-lineno-list)
-	    (erl-ecs-remove-overlays 'erl-ecs-dialyzer-overlay))
+	    (erl-ecs-delete-items 'dialyzer erl-ecs-lineno-list))
 
 	   ;; dialyzer warnings
 	   (['rex ['w warnings]]
@@ -255,16 +295,18 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
 	    (setq erl-ecs-dialyzer-list warnings)
 	    (erl-ecs-print-errors 'dialyzer erl-ecs-dialyzer-list 'erl-ecs-dialyzer-overlay))
 
-	   (else (erl-ecs-remove-overlays 'erl-ecs-dialyzer-overlay)))))))
+	   (else))))))
 
 (defun erl-ecs-check-xref ()
   "Checks for exported function that is not used outside the module."
-  (interactive)
+
   (erl-ecs-message "ECS: Checking XREF.")
 
   (let ((node (erl-target-node))
 	(path (buffer-file-name))
 	(expline (erl-ecs-find-exportline)))
+
+    (erl-ecs-remove-overlays 'erl-ecs-xref-overlay)
 
     (erl-spawn
       (erl-send-rpc node 'erlang_compile_server 'xref (list path))
@@ -273,8 +315,7 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
 	  ((['rex ['ok]]
 	    (erl-ecs-message "ECS XREF: No warnings.")
 	    (setq erl-ecs-xref-list '())
-	    (erl-ecs-delete-items 'xref erl-ecs-lineno-list)
-	    (erl-ecs-remove-overlays 'erl-ecs-xref-overlay))
+	    (erl-ecs-delete-items 'xref erl-ecs-lineno-list))
 	   
 	   ;; xref warnings
 	   (['rex ['w warnings]]
@@ -283,11 +324,10 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
 	      (setq erl-ecs-xref-list a)
 	      (erl-ecs-print-errors 'xref erl-ecs-xref-list 'erl-ecs-xref-overlay)))
 
-	   (else (erl-ecs-remove-overlays 'erl-ecs-xref-overlay)))))))
+	   (else))))))
 
 (defun erl-ecs-check-eunit ()
   "Checks eunit tests."
-  (interactive)
 
   (erl-ecs-message "ECS: Checking EUNIT.")
 
@@ -325,7 +365,6 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
   "Find the includefiles for an erlang module."
   (save-excursion
     (set-buffer erl-ecs-current-buffer)
-    (goto-char (point-min))
     (let ((inc-regexp (concat "^-include\\(_lib\\)?(\"\\([^\)]*\\)"))
 	  (include-list '())
 	  (pt (point-min)))
@@ -384,7 +423,7 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
 	     (if (string= (tuple-elt x 2) "error")
 		 'erl-ecs-error-line
 	       'erl-ecs-warning-line)
-	   (if lesser-face lesser-face 'erl-ecs-warning-line))
+	   (if lesser-face lesser-face 'erl-ecs-lesser-line))
 	 (format "%s: %s @line %s " (tuple-elt x 2) (tuple-elt x 3) (tuple-elt x 1))
 	 lesser)) err-list)
     (setq erl-ecs-lineno-list (append erl-ecs-lineno-list err-list))))
@@ -401,41 +440,70 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
     ov))
 
 (defun erl-ecs-goto-error (&optional prev pos)
-  (let ((delta (line-number-at-pos (if prev (point-min) (point-max))))
-	(pt (line-number-at-pos pos)))
-    (dolist (it erl-ecs-lineno-list delta) (when (or (and (not prev)
-						    (> (elt it 0) pt)
-						    (< (elt it 0) delta))
-					       (and prev
-						    (< (elt it 0) pt)
-						    (> (elt it 0) delta)))
-				       (setq delta (elt it 0))))))
+  (let* ((delta (line-number-at-pos (if prev (point-min) (point-max))))
+	(pt (line-number-at-pos pos))
+	(skip-counter 0)
+	(min-max delta)
+	(comparison delta))
+    (dolist (it erl-ecs-lineno-list delta)
+      ;; set the first/last err
+      (when (or (and prev
+		     (> (elt it 0) min-max))
+		(and (not prev)
+		     (< (elt it 0) min-max)))
+	(setq min-max (elt it 0)))
+      ;; set how many errors on the given line
+      (when (= (elt it 0) pt) (setq skip-counter (+ 1 skip-counter)))
+      ;; set the next/prev error
+      (when (or (and (not prev)
+		     (> (elt it 0) pt)
+		     (< (elt it 0) delta))
+		(and prev
+		     (< (elt it 0) pt)
+		     (> (elt it 0) delta)))
+	(setq delta (elt it 0))))
+      (cons (if (= delta comparison) min-max delta) skip-counter)))
 
 (defun erl-ecs-next-error ()
+  "Moves point to the next error and prints the error."
   (interactive)
-  (let ((max (line-number-at-pos (point-max)))
-	(next (erl-ecs-goto-error)))
+  (let* ((max (line-number-at-pos (point-max)))
+	 (next-pair (erl-ecs-goto-error))
+	 (next-err-line (car next-pair))
+	 (total-errs-on-line (cdr next-pair)))
 
-    (goto-char
-     (erl-ecs-goto-beg-of-line
-      (if (= next max)
-	  (erl-ecs-goto-error nil (point-min))
-	next)))
+    (if (>= erl-ecs-error-index total-errs-on-line)
+	(progn
+	  (setq erl-ecs-error-index 1)
+	  (goto-char
+	   (erl-ecs-goto-beg-of-line
+	      next-err-line)))
+      (setq erl-ecs-error-index (+ 1 erl-ecs-error-index)))
+    
     (erl-ecs-show-error-on-line)))
 
 (defun erl-ecs-prev-error ()
+  "Moves point to the previous error and prints the error."
   (interactive)
-  (let ((min (line-number-at-pos (point-min)))
-	(prev (erl-ecs-goto-error t)))
+  (let* ((min (line-number-at-pos (point-min)))
+	(prev-pair (erl-ecs-goto-error t))
+	(prev-err-line (car prev-pair))
+	(total-errs-on-line (cdr prev-pair)))
 
-    (goto-char
-     (erl-ecs-goto-beg-of-line
-      (if (= prev min)
-	  (erl-ecs-goto-error t (point-max))
-	prev)))
-     (erl-ecs-show-error-on-line)))
+    (if (>= erl-ecs-error-index total-errs-on-line)
+	(progn
+	  (setq erl-ecs-error-index 1)
+	  (goto-char
+	   (erl-ecs-goto-beg-of-line
+	    (if (= prev-err-line min)
+		(erl-ecs-goto-error t (point-max))
+	      prev-err-line))))
+      (setq erl-ecs-error-index (+ erl-ecs-error-index 1)))
+
+    (erl-ecs-show-error-on-line)))
 
 (defun erl-ecs-next-line ()
+  "Moves point to the next line using `next-line' and then prints the error if there is one."
   (interactive)
   (next-line)
   (erl-ecs-show-error-on-line))
@@ -446,6 +514,7 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
   (erl-ecs-show-error-on-line))
 
 (defun erl-ecs-show-error-on-line (&optional line)
+  "Prints the error for a certain line. If more than one error, prints the one given by `erl-ecs-error-index'."
   (interactive)
   (let* ((line (or line (line-number-at-pos)))
 	 (tag (erl-ecs-get-tag line))
@@ -457,12 +526,18 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
 		     (erl-ecs-get-item-match line erl-ecs-xref-list 1))
 		    ((equal tag 'dialyzer)
 		     (erl-ecs-get-item-match line erl-ecs-dialyzer-list 1))
-		    ((equal tag 'user-specified-error) (erl-ecs-get-item-match line erl-ecs-user-specified-errors 1)))))
+		    ((equal tag 'user-specified-error)
+		     (erl-ecs-get-item-match line erl-ecs-user-specified-errors 1)))))
     (when ret (message "%s %s" tag (erl-ecs-format-output ret)))))
 
 (defun erl-ecs-get-tag (line)
-  (let (tag)
-    (dolist (it erl-ecs-lineno-list tag) (when (equal (elt it 0) line) (setq tag (elt it 1))))))
+  (let ((skip 0)
+	tag)
+    (dolist (it erl-ecs-lineno-list tag)
+      (when (equal (elt it 0) line)
+	(setq skip (+ 1 skip))
+	(when (= skip erl-ecs-error-index)
+	  (setq tag (elt it 1)))))))
 
 (defun erl-ecs-get-item-match (match lista vectpos)
   (let (item)
@@ -475,17 +550,35 @@ Extra compile options could also be specified by setting the `erl-ecs-compile-op
   (when erl-ecs-verbose (message msg r)))
 
 (defun erl-ecs-delete-items (tag erl-ecs-list)
- "Deletes all items that has a value matching 'tag' from a list"
+ "Deletes all items that has a value matching `TAG' from a list"
  (let ((new-list '()))
    (dolist (it erl-ecs-list new-list)
        (unless (equal tag (elt it 1)) (setq new-list (cons it new-list))))
    (setq erl-ecs-lineno-list new-list)))
+
+(defun erl-ecs-check-backends ()
+  (interactive)
+  (unless (member 'xref erl-ecs-backends)
+    (erl-ecs-message "xref not set")
+    (setq erl-ecs-enable-xref nil))
+  (unless (member 'eunit erl-ecs-backends)
+    (erl-ecs-message "eunit not set")
+    (setq erl-ecs-enable-eunit nil))
+  (unless (member 'dialyzer erl-ecs-backends)
+    (erl-ecs-message "dialyzer not set")
+    (setq erl-ecs-enable-dialyzer nil)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;            TODO            ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defun erl-ecs-start-interval ())
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;           Last             ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(add-hook 'erl-ecs-before-eval-hooks 'erl-ecs-check-backends)
 
 (erl-ecs-setup)
 
